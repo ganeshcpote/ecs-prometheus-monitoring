@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Provision the required resources for blog post example 'Prometheus service discovery for AWS ECS'.
+  Wait for creation to complete before testing.
+Parameters:
+  PrometheusConfigLocation:
+    Type: String
+    Description: The location of your Prometheus configuration file
+    Default: https://tomgregory-cloudformation-resources.s3-eu-west-1.amazonaws.com/prometheus.yml
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub 'VPC - ${AWS::StackName}'
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'IGW - ${AWS::StackName}'
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.128/26
+      MapPublicIpOnLaunch: True
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Public Subnet 1 - ${AWS::StackName}'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'Public Route Table - ${AWS::StackName}'
+  PublicRouteTableEntry:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteTableSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: service-discovery-example-cluster
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ServiceSecurityGroup
+      GroupDescription: Security group for service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub sample-metrics-application-task
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: sample-metrics-application
+          Image: tkgregory/sample-metrics-application
+          PortMappings:
+            - ContainerPort: 8080
+          DockerLabels:
+            PROMETHEUS_EXPORTER_PATH: /actuator/prometheus
+            PROMETHEUS_EXPORTER_PORT: 8080
+      RequiresCompatibilities:
+        - EC2
+        - FARGATE
+  ServiceA:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet
+          SecurityGroups:
+            - !GetAtt ServiceSecurityGroup.GroupId
+  ServiceB:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet
+          SecurityGroups:
+            - !GetAtt ServiceSecurityGroup.GroupId
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: local
+      Vpc: !Ref VPC
+  PrometheusTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prometheus-for-ecs
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      TaskRoleArn: !Ref PrometheusRole
+      ExecutionRoleArn: !Ref PrometheusExecutionRole
+      Volumes:
+        - Name: config
+      ContainerDefinitions:
+        - Name: prometheus-for-ecs
+          Image: tkgregory/prometheus-with-remote-configuration:latest
+          Environment:
+            - Name: CONFIG_LOCATION
+              Value: !Ref PrometheusConfigLocation
+          PortMappings:
+            - ContainerPort: 9090
+          MountPoints:
+            - SourceVolume: config
+              ContainerPath: /output
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PrometheusLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: prometheus-for-ecs
+        - Name: prometheus-ecs-discovery
+          Image: tkgregory/prometheus-ecs-discovery:latest
+          Command:
+            - '-config.write-to=/output/ecs_file_sd.yml'
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          MountPoints:
+            - SourceVolume: config
+              ContainerPath: /output
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PrometheusLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: prometheus-ecs-discovery
+      RequiresCompatibilities:
+        - EC2
+        - FARGATE
+  PrometheusService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref PrometheusTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet
+          SecurityGroups:
+            - !GetAtt PrometheusSecurityGroup.GroupId
+  PrometheusSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PrometheusSecurityGroup
+      GroupDescription: Security group for Prometheus
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: 0.0.0.0/0
+  PrometheusExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prometheus-execution-role
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  PrometheusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prometheus-role
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyName: ECSAccess
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - ecs:ListClusters
+                  - ecs:ListTasks
+                  - ecs:DescribeTask
+                  - ec2:DescribeInstances
+                  - ecs:DescribeContainerInstances
+                  - ecs:DescribeTasks
+                  - ecs:DescribeTaskDefinition
+                Effect: Allow
+                Resource: '*'
+  PrometheusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: prometheus
+      RetentionInDays: 7
